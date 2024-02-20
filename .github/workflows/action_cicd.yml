@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=./job_deploy.yml
+name: "Action CICD Terraform Plan Apply"
+concurrency: toy-company
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Lint the Bicep file.
+  lint:
+    uses: ./.github/workflows/job_lint.yml
+
+  # Plan all stages.
+  parrallel-plan:
+    uses: ./.github/workflows/job_validate_matrix.yml
+    needs: lint
+    with:
+      # environmentType: ${{ matrix.path }}
+      resourceGroupName: ToyWebsiteTest
+      reviewApiUrl: https://api.contoso.com/reviews
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID_TEST }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      reviewApiKey: ${{ secrets.REVIEW_API_KEY_TEST }}
+
+  # Deploy to the test environment.
+  deploy-test:
+    uses: ./.github/workflows/job_deploy.yml
+    needs: parrallel-plan
+    with:
+      environmentType: test
+      resourceGroupName: ToyWebsiteTest
+      reviewApiUrl: https://sandbox.contoso.com/reviews
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID_TEST }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      reviewApiKey: ${{ secrets.REVIEW_API_KEY_TEST }}
+
+  # Deploy to the production environment.
+  deploy-production:
+    uses: ./.github/workflows/job_deploy.yml
+    needs: deploy-test
+    with:
+      environmentType: production
+      resourceGroupName: ToyWebsiteProduction
+      reviewApiUrl: https://api.contoso.com/reviews
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID_PRODUCTION }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      reviewApiKey: ${{ secrets.REVIEW_API_KEY_PRODUCTION }}

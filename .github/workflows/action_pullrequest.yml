@@ -1,0 +1,165 @@
+name: "Action PR Test and Validate"
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  pull_request:
+    branches:
+      - main
+
+#Special permissions required for OIDC authentication
+#actions: read --> only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+permissions:
+  id-token: write
+  #actions: read --> only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+  actions: read
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  LOCATION: "australiaeast"
+  reviewApiUrl: "https://api.contoso.com/reviews"
+  reviewApiKey: "12345"
+
+  ARM_TENANT_ID: ${{ vars.VAR_ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.VAR_ARM_SUBSCRIPTION_ID }}
+  ARM_CLIENT_ID_TEST: ${{ vars.VAR_ARM_CLIENT_ID_TEST }}
+  ARM_CLIENT_ID_PROD: ${{ vars.VAR_ARM_CLIENT_ID_PROD }}
+
+jobs:
+  generateInputPaths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Generate matrix ### Followed this example - https://github.com/Sylius/Sylius/blob/3464e8d0ae6673d9ee1da3d538a6b399cfcb9852/.github/workflows/packages.yml#L48
+        working-directory: ${{ github.workspace }}/_demo_multi-stage-actions
+        id: set-matrix
+        run: |
+          echo "matrix=$(find . -mindepth 1 -type d | sed -e 's/.\///' | sort | jq  --raw-input . | jq --slurp . | jq -c .)" >> $GITHUB_OUTPUT
+          echo '#################################'
+          cat $GITHUB_OUTPUT
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+  bicep-whatif:
+    name: "Bicep Whatif for PR"
+    needs: generateInputPaths
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path: ${{ fromJson(needs.generateInputPaths.outputs.matrix) }}
+
+    steps:
+      # Checkout the repository to the GitHub Actions runner
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # Authenticate to Az CLI using OIDC
+      - name: "Az CLI login"
+        uses: azure/login@v1
+        if: matrix.path == 'test'
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID_TEST }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: "Az CLI login"
+        uses: azure/login@v1
+        if: matrix.path == 'production'
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID_PROD }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+        # Checks that all Bicep configuration files adhere to a canonical format
+      - name: Bicep Lint
+        uses: Azure/cli@v1
+        with:
+          inlineScript: az bicep build --file ${{ github.workspace }}/_demo_multi-stage-actions/main.bicep
+
+      # Validate whether a template is valid at subscription scope
+      - name: Bicep Validate
+        uses: Azure/cli@v1
+        with:
+          inlineScript: |
+            az deployment group validate \
+              --name validate-${{ github.run_id }} \
+              --resource-group ToyWebsite${{ matrix.path }} \
+              --template-file  ${{ github.workspace }}/_demo_multi-stage-actions/main.bicep \
+              --parameters ${{ github.workspace }}/_demo_multi-stage-actions/${{ matrix.path }}/parameters.json \
+              --parameters reviewApiUrl=${{ env.reviewApiUrl }} reviewApiKey=${{ env.reviewApiKey }}
+
+      - name: Checkov GitHub Action
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          framework: bicep
+          # This will add both a CLI output to the console and create a results.sarif file
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+
+        # Results are generated only on a success or failure
+        # this is required since GitHub by default won't run the next step
+        # when the previous one has failed. Security checks that do not pass will 'fail'.
+        # An alternative is to add `continue-on-error: true` to the previous step
+        # Or 'soft_fail: true' to checkov.
+        if: success() || failure()
+        with:
+          sarif_file: results.sarif
+
+      - name: "What-If"
+        uses: Azure/cli@v1
+        with:
+          inlineScript: |
+            az deployment group what-if \
+              --name whatif-${{ github.run_id }} \
+              --resource-group ToyWebsite${{ matrix.path }} \
+              --template-file  ${{ github.workspace }}/_demo_multi-stage-actions/main.bicep \
+              --parameters ${{ github.workspace }}/_demo_multi-stage-actions/${{ matrix.path }}/parameters.json \
+              --parameters reviewApiUrl=${{ env.reviewApiUrl }} reviewApiKey=${{ env.reviewApiKey }} > whatif
+
+        # Create string output of Whatif
+      - name: Create String Output
+        id: whatif-string
+        run: |
+          WHATIF=$(cat whatif)
+
+          delimiter="$(openssl rand -hex 8)"
+          echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+          echo "## Whatif Output --> ${{ matrix.path }} Environment" >> $GITHUB_OUTPUT
+          echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "$WHATIF" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "</details>" >> $GITHUB_OUTPUT
+          echo "${delimiter}" >> $GITHUB_OUTPUT
+
+      # Publish Terraform Plan as task summary
+      - name: Publish Whatif to Task Summary
+        env:
+          SUMMARY: ${{ steps.whatif-string.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      # If this is a PR post the changes
+      - name: Push Whatif Output to PR
+        if: github.ref != 'refs/heads/main'
+        uses: actions/github-script@v6
+        env:
+          SUMMARY: "${{ steps.whatif-string.outputs.summary }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = `${process.env.SUMMARY}`;
+            github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+            })
